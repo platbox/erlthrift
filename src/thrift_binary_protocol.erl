@@ -156,7 +156,7 @@ write(This, {double, Double}) ->
 
 write(This0, {string, Str}) when is_list(Str) ->
     {This1, ok} = write(This0, {i32, length(Str)}),
-    {This2, ok} = write(This1, list_to_binary(Str)),
+    {This2, ok} = write(This1, iolist_to_binary(Str)),
     {This2, ok};
 
 write(This0, {string, Bin}) when is_binary(Bin) ->
@@ -164,7 +164,7 @@ write(This0, {string, Bin}) when is_binary(Bin) ->
     {This2, ok} = write(This1, Bin),
     {This2, ok};
 
-%% Data :: iolist()
+%% Data :: binary()
 write(This = #binary_protocol{transport = Trans}, Data) ->
     {NewTransport, Result} = thrift_transport:write(Trans, Data),
     {This#binary_protocol{transport = NewTransport}, Result}.
@@ -185,11 +185,11 @@ read(This0, message_begin) ->
 
         {ok, Sz} when Sz < 0 ->
             %% there's a version number but it's unexpected
-            {This1, {error, {bad_binary_protocol_version, Sz}}};
+            error({bad_binary_protocol_version, Sz});
 
         {ok, _Sz} when This1#binary_protocol.strict_read =:= true ->
             %% strict_read is true and there's no version header; that's an error
-            {This1, {error, no_binary_protocol_version}};
+            error(no_binary_protocol_version);
 
         {ok, Sz} when This1#binary_protocol.strict_read =:= false ->
             %% strict_read is false, so just read the old way
