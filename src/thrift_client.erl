@@ -77,12 +77,22 @@ send_function_call(Client = #tclient{protocol = Proto0,
             Begin = #protocol_message_begin{name = atom_to_list(Function),
                                             type = ?tMessageType_CALL,
                                             seqid = SeqId},
-            {Proto1, ok} = thrift_protocol:write(Proto0, Begin),
-            {Proto2, ok} = thrift_protocol:write(Proto1, {Params, list_to_tuple([Function | Args])}),
-            {Proto3, ok} = thrift_protocol:write(Proto2, message_end),
-            {Proto4, ok} = thrift_protocol:flush_transport(Proto3),
-            {Client#tclient{protocol = Proto4}, ok}
+            case write(Proto0, [Begin, {Params, list_to_tuple([Function | Args])}, message_end]) of
+                {Proto1, ok} ->
+                    {Proto2, ok} = thrift_protocol:flush_transport(Proto1),
+                    {Client#tclient{protocol = Proto2}, ok};
+                {ProtoE, Error} ->
+                    {Client#tclient{protocol = ProtoE}, Error}
+            end
     end.
+
+write(Proto, [Data | Rest]) ->
+    case thrift_protocol:write(Proto, Data) of
+        {Proto1, ok} -> write(Proto1, Rest);
+        Error -> Error
+    end;
+write(Proto, []) ->
+    {Proto, ok}.
 
 -spec receive_function_result(#tclient{}, atom()) -> {#tclient{}, {ok, any()} | {error, any()}}.
 receive_function_result(Client = #tclient{service = Service}, Function) ->

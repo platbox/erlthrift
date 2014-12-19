@@ -24,6 +24,7 @@
          read/2,
          read/3,
          skip/2,
+         validate/2,
          flush_transport/1,
          close_transport/1,
          typeid_to_atom/1
@@ -91,32 +92,28 @@ term_to_typeid({list, _}) -> ?tType_LIST.
 %% Structure is like:
 %%    [{Fid, Type}, ...]
 -spec read(#protocol{}, {struct, _StructDef}, atom()) -> {#protocol{}, {ok, tuple()}}.
-read(IProto0, {struct, Structure}, Tag)
-  when is_list(Structure), is_atom(Tag) ->
+read(IProto0, {struct, StructDef}, Tag)
+  when is_list(StructDef), is_atom(Tag) ->
 
     % If we want a tagged tuple, we need to offset all the tuple indices
     % by 1 to avoid overwriting the tag.
     Offset = if Tag =/= undefined -> 1; true -> 0 end,
-    IndexList = case length(Structure) of
-                    N when N > 0 -> lists:seq(1 + Offset, N + Offset);
-                    _ -> []
-                end,
-
-    SWithIndices = [{Fid, {Type, Index}} ||
-                       {{Fid, Type}, Index} <-
-                           lists:zip(Structure, IndexList)],
-    % Fid -> {Type, Index}
-    SDict = dict:from_list(SWithIndices),
 
     {IProto1, ok} = read(IProto0, struct_begin),
-    RTuple0 = erlang:make_tuple(length(Structure) + Offset, undefined),
+    RTuple0 = erlang:make_tuple(length(StructDef) + Offset, undefined),
     RTuple1 = if Tag =/= undefined -> setelement(1, RTuple0, Tag);
                  true              -> RTuple0
               end,
 
-    {IProto2, RTuple2} = read_struct_loop(IProto1, SDict, RTuple1),
-    {IProto2, {ok, RTuple2}}.
+    StructIndex = zip(1 + Offset, StructDef),
+    read_struct_loop(IProto1, StructIndex, RTuple1).
 
+zip(_, []) ->
+    [];
+zip(N, [{Fid, _Req, Type, Name, _Default} | Rest]) ->
+    [{N, Fid, Type, Name} | zip(N + 1, Rest)];
+zip(N, [{Fid, Type} | Rest]) ->
+    [{N, Fid, Type, Type} | zip(N + 1, Rest)].
 
 %% NOTE: Keep this in sync with thrift_protocol_behaviour:read
 -spec read
@@ -128,7 +125,7 @@ read(IProto0, {struct, Structure}, Tag)
 
 read(IProto, {struct, {Module, StructureName}}) when is_atom(Module),
                                                      is_atom(StructureName) ->
-    read(IProto, Module:struct_info(StructureName), StructureName);
+    read(IProto, Module:struct_info_ext(StructureName), StructureName);
 
 read(IProto, S={struct, Structure}) when is_list(Structure) ->
     read(IProto, S, undefined);
@@ -195,37 +192,36 @@ read_specific(Proto = #protocol{module = Module,
     {NewData, Result} = Module:read(ModuleData, ProtocolType),
     {Proto#protocol{data = NewData}, Result}.
 
-read_struct_loop(IProto0, SDict, RTuple) ->
+read_struct_loop(IProto0, StructIndex, RTuple) ->
     {IProto1, #protocol_field_begin{type = FType, id = Fid}} =
         thrift_protocol:read(IProto0, field_begin),
     case {FType, Fid} of
         {?tType_STOP, _} ->
-            {IProto1, RTuple};
+            {IProto1, {ok, RTuple}};
         _Else ->
-            case dict:find(Fid, SDict) of
-                {ok, {Type, Index}} ->
+            case lists:keyfind(Fid, 2, StructIndex) of
+                {N, Fid, Type, Name} ->
                     case term_to_typeid(Type) of
                         FType ->
                             {IProto2, {ok, Val}} = read(IProto1, Type),
                             {IProto3, ok} = thrift_protocol:read(IProto2, field_end),
-                            NewRTuple = setelement(Index, RTuple, Val),
-                            read_struct_loop(IProto3, SDict, NewRTuple);
-                        Expected ->
-                            error_logger:info_msg(
-                              "Skipping field ~p with wrong type (~p != ~p)~n",
-                              [Fid, FType, Expected]),
-                            skip_field(FType, IProto1, SDict, RTuple)
+                            NewRTuple = setelement(N, RTuple, Val),
+                            read_struct_loop(IProto3, StructIndex, NewRTuple);
+                        _Expected ->
+                            error_logger:info_msg("Skipping field ~p with wrong type: ~p~n", [Name, typeid_to_atom(FType)]),
+                            skip_field(FType, IProto1, StructIndex, RTuple)
                     end;
-                _Else2 ->
-                    skip_field(FType, IProto1, SDict, RTuple)
+                false ->
+                    error_logger:info_msg("Skipping unknown field (~p) with type: ~p~n", [Fid, typeid_to_atom(FType)]),
+                    skip_field(FType, IProto1, StructIndex, RTuple)
             end
     end.
 
-skip_field(FType, IProto0, SDict, RTuple) ->
+skip_field(FType, IProto0, StructIndex, RTuple) ->
     FTypeAtom = thrift_protocol:typeid_to_atom(FType),
-    {IProto1, ok} = thrift_protocol:skip(IProto0, FTypeAtom),
+    {IProto1, ok} = skip(IProto0, FTypeAtom),
     {IProto2, ok} = read(IProto1, field_end),
-    read_struct_loop(IProto2, SDict, RTuple).
+    read_struct_loop(IProto2, StructIndex, RTuple).
 
 -spec skip(#protocol{}, any()) -> {#protocol{}, ok}.
 
@@ -269,38 +265,24 @@ skip_struct_loop(Proto0) ->
             skip_struct_loop(Proto3)
     end.
 
-skip_map_loop(Proto0, Map = #protocol_map_begin{ktype = Ktype,
-                                                vtype = Vtype,
-                                                size = Size}) ->
-    case Size of
-        N when N > 0 ->
-            {Proto1, ok} = skip(Proto0, Ktype),
-            {Proto2, ok} = skip(Proto1, Vtype),
-            skip_map_loop(Proto2,
-                          Map#protocol_map_begin{size = Size - 1});
-        0 -> {Proto0, ok}
-    end.
+skip_map_loop(Proto0, #protocol_map_begin{size = 0}) ->
+    {Proto0, ok};
+skip_map_loop(Proto0, Map = #protocol_map_begin{ktype = Ktype, vtype = Vtype, size = Size}) ->
+    {Proto1, ok} = skip(Proto0, Ktype),
+    {Proto2, ok} = skip(Proto1, Vtype),
+    skip_map_loop(Proto2, Map#protocol_map_begin{size = Size - 1}).
 
-skip_set_loop(Proto0, Map = #protocol_set_begin{etype = Etype,
-                                                size = Size}) ->
-    case Size of
-        N when N > 0 ->
-            {Proto1, ok} = skip(Proto0, Etype),
-            skip_set_loop(Proto1,
-                          Map#protocol_set_begin{size = Size - 1});
-        0 -> {Proto0, ok}
-    end.
+skip_set_loop(Proto0, #protocol_set_begin{size = 0}) ->
+    {Proto0, ok};
+skip_set_loop(Proto0, Map = #protocol_set_begin{etype = Etype, size = Size}) ->
+    {Proto1, ok} = skip(Proto0, Etype),
+    skip_set_loop(Proto1, Map#protocol_set_begin{size = Size - 1}).
 
-skip_list_loop(Proto0, Map = #protocol_list_begin{etype = Etype,
-                                                  size = Size}) ->
-    case Size of
-        N when N > 0 ->
-            {Proto1, ok} = skip(Proto0, Etype),
-            skip_list_loop(Proto1,
-                           Map#protocol_list_begin{size = Size - 1});
-        0 -> {Proto0, ok}
-    end.
-
+skip_list_loop(Proto0, #protocol_list_begin{size = 0}) ->
+    {Proto0, ok};
+skip_list_loop(Proto0, Map = #protocol_list_begin{etype = Etype, size = Size}) ->
+    {Proto1, ok} = skip(Proto0, Etype),
+    skip_list_loop(Proto1, Map#protocol_list_begin{size = Size - 1}).
 
 %%--------------------------------------------------------------------
 %% Function: write(OProto, {Type, Data}) -> ok
@@ -322,37 +304,43 @@ skip_list_loop(Proto0, Map = #protocol_list_begin{etype = Etype,
 %%--------------------------------------------------------------------
 -spec write(#protocol{}, any()) -> {#protocol{}, ok | {error, _Reason}}.
 
-write(Proto0, {{struct, StructDef}, Data})
+write(Proto, TypeData) ->
+    case validate(TypeData) of
+        ok -> write_(Proto, TypeData);
+        Error -> {Proto, Error}
+    end.
+
+write_(Proto0, {{struct, StructDef}, Data})
   when is_list(StructDef), is_tuple(Data), length(StructDef) == size(Data) - 1 ->
 
     [StructName | Elems] = tuple_to_list(Data),
-    {Proto1, ok} = write(Proto0, #protocol_struct_begin{name = StructName}),
+    {Proto1, ok} = write_(Proto0, #protocol_struct_begin{name = StructName}),
     {Proto2, ok} = struct_write_loop(Proto1, StructDef, Elems),
-    {Proto3, ok} = write(Proto2, struct_end),
+    {Proto3, ok} = write_(Proto2, struct_end),
     {Proto3, ok};
 
-write(Proto, {{struct, {Module, StructureName}}, Data})
+write_(Proto, {{struct, {Module, StructureName}}, Data})
   when is_atom(Module),
        is_atom(StructureName),
        element(1, Data) =:= StructureName ->
-    write(Proto, {Module:struct_info(StructureName), Data});
+    write_(Proto, {Module:struct_info(StructureName), Data});
 
-write(_, {{struct, {Module, StructureName}}, Data})
+write_(_, {{struct, {Module, StructureName}}, Data})
   when is_atom(Module),
        is_atom(StructureName) ->
     erlang:error(struct_unmatched, {{provided, element(1, Data)},
                              {expected, StructureName}});
 
-write(Proto, {{enum, Fields}, Data}) when is_list(Fields), is_atom(Data) ->
+write_(Proto, {{enum, Fields}, Data}) when is_list(Fields), is_atom(Data) ->
     {Data, IVal} = lists:keyfind(Data, 1, Fields),
-    write(Proto, {i32, IVal});
+    write_(Proto, {i32, IVal});
 
-write(Proto, {{enum, {Module, EnumName}}, Data})
+write_(Proto, {{enum, {Module, EnumName}}, Data})
   when is_atom(Module),
        is_atom(EnumName) ->
-    write(Proto, {Module:enum_info(EnumName), Data});
+    write_(Proto, {Module:enum_info(EnumName), Data});
 
-write(Proto0, {{list, Type}, Data})
+write_(Proto0, {{list, Type}, Data})
   when is_list(Data) ->
     {Proto1, ok} = write(Proto0,
                #protocol_list_begin{
@@ -360,7 +348,7 @@ write(Proto0, {{list, Type}, Data})
                  size = length(Data)
                 }),
     Proto2 = lists:foldl(fun(Elem, ProtoIn) ->
-                                 {ProtoOut, ok} = write(ProtoIn, {Type, Elem}),
+                                 {ProtoOut, ok} = write_(ProtoIn, {Type, Elem}),
                                  ProtoOut
                          end,
                          Proto1,
@@ -368,7 +356,7 @@ write(Proto0, {{list, Type}, Data})
     {Proto3, ok} = write(Proto2, list_end),
     {Proto3, ok};
 
-write(Proto0, {{map, KeyType, ValType}, Data}) ->
+write_(Proto0, {{map, KeyType, ValType}, Data}) ->
     {Proto1, ok} = write(Proto0,
                          #protocol_map_begin{
                            ktype = term_to_typeid(KeyType),
@@ -376,16 +364,16 @@ write(Proto0, {{map, KeyType, ValType}, Data}) ->
                            size  = map_size(Data)
                           }),
     Proto2 = maps:fold(fun(KeyData, ValData, ProtoS0) ->
-                               {ProtoS1, ok} = write(ProtoS0, {KeyType, KeyData}),
-                               {ProtoS2, ok} = write(ProtoS1, {ValType, ValData}),
+                               {ProtoS1, ok} = write_(ProtoS0, {KeyType, KeyData}),
+                               {ProtoS2, ok} = write_(ProtoS1, {ValType, ValData}),
                                ProtoS2
                        end,
                        Proto1,
                        Data),
-    {Proto3, ok} = write(Proto2, map_end),
+    {Proto3, ok} = write_(Proto2, map_end),
     {Proto3, ok};
 
-write(Proto0, {{set, Type}, Data}) ->
+write_(Proto0, {{set, Type}, Data}) ->
     true = ordsets:is_set(Data),
     {Proto1, ok} = write(Proto0,
                          #protocol_set_begin{
@@ -393,7 +381,7 @@ write(Proto0, {{set, Type}, Data}) ->
                            size  = ordsets:size(Data)
                           }),
     Proto2 = ordsets:fold(fun(Elem, ProtoIn) ->
-                               {ProtoOut, ok} = write(ProtoIn, {Type, Elem}),
+                               {ProtoOut, ok} = write_(ProtoIn, {Type, Elem}),
                                ProtoOut
                        end,
                        Proto1,
@@ -401,7 +389,7 @@ write(Proto0, {{set, Type}, Data}) ->
     {Proto3, ok} = write(Proto2, set_end),
     {Proto3, ok};
 
-write(Proto = #protocol{module = Module,
+write_(Proto = #protocol{module = Module,
                         data = ModuleData}, Data) ->
     {NewData, Result} = Module:write(ModuleData, Data),
     {Proto#protocol{data = NewData}, Result}.
@@ -411,15 +399,78 @@ struct_write_loop(Proto0, [{Fid, Type} | RestStructDef], [Data | RestData]) ->
                    undefined ->
                        Proto0; % null fields are skipped in response
                    _ ->
-                       {Proto1, ok} = write(Proto0,
+                       {Proto1, ok} = write_(Proto0,
                                            #protocol_field_begin{
                                              type = term_to_typeid(Type),
                                              id = Fid
                                             }),
-                       {Proto2, ok} = write(Proto1, {Type, Data}),
-                       {Proto3, ok} = write(Proto2, field_end),
+                       {Proto2, ok} = write_(Proto1, {Type, Data}),
+                       {Proto3, ok} = write_(Proto2, field_end),
                        Proto3
                end,
     struct_write_loop(NewProto, RestStructDef, RestData);
 struct_write_loop(Proto, [], []) ->
-    write(Proto, field_stop).
+    write_(Proto, field_stop).
+
+%%
+
+validate(#protocol_message_begin{}) -> ok;
+validate(#protocol_struct_begin{}) -> ok;
+validate(#protocol_field_begin{}) -> ok;
+validate(#protocol_map_begin{}) -> ok;
+validate(#protocol_list_begin{}) -> ok;
+validate(#protocol_set_begin{}) -> ok;
+validate(message_end) -> ok;
+validate(field_end) -> ok;
+validate(struct_end) -> ok;
+validate(list_end) -> ok;
+validate(set_end) -> ok;
+validate(map_end) -> ok;
+
+validate(TypeData) ->
+    try validate(TypeData, []) catch
+        throw:{invalid, Path, _Type, Value} ->
+            {error, {invalid, get_path_literal(Path), Value}}
+    end.
+
+validate(TypeData, Path) ->
+    validate(required, TypeData, Path).
+
+validate(optional, {_Type, undefined}, _Path) ->
+    ok;
+validate(_Req, {{list, Type}, Data}, Path) when is_list(Data) ->
+    lists:foreach(fun (E) -> validate({Type, E}, Path) end, Data);
+validate(_Req, {{set, Type}, Data}, Path) when is_list(Data) ->
+    lists:foreach(fun (E) -> validate({Type, E}, Path) end, (ordsets:to_list(Data)));
+validate(_Req, {{map, KType, VType}, Data}, Path) when is_map(Data) ->
+    maps:fold(fun (K, V, _) -> validate({KType, K}, Path), validate({VType, V}, Path), ok end, ok, Data);
+validate(_Req, {{struct, {Mod, Name}}, Data}, Path) when is_tuple(Data) ->
+    [_ | Elems] = tuple_to_list(Data),
+    {struct, Types} = Mod:struct_info_ext(Name),
+    validate_struct(Types, Elems, Path);
+validate(_Req, {{struct, StructDef}, Data}, Path) when is_tuple(Data), is_list(StructDef) ->
+    [_ | Elems] = tuple_to_list(Data),
+    validate_struct(StructDef, Elems, Path);
+validate(_Req, {{enum, _Fields}, Value}, _Path) when is_atom(Value), Value =/= undefined ->
+    ok;
+
+validate(_Req, {string, Value}, _Path) when is_binary(Value) -> ok;
+validate(_Req, {bool, Value}, _Path) when is_boolean(Value) -> ok;
+validate(_Req, {_Type, Value}, _Path) when is_number(Value) -> ok;
+validate(_Req, {_Type, Value}, _Path) when is_number(Value) -> ok;
+validate(_Req, {Type, Value}, Path) -> throw({invalid, Path, Type, Value}).
+
+validate_struct(Types, Elems, Path) ->
+    lists:foreach(
+        fun
+            ({{_, Req, Type, Name, _}, Data}) -> validate(Req, {Type, Data}, [Name | Path]);
+            ({{_, Type}, Data})               -> validate(required, {Type, Data}, Path)
+        end,
+        lists:zip(Types, Elems)
+    ).
+
+get_path_literal(Path) ->
+    case lists:foldl(fun (E, A) -> [$. | atom_to_list(E) ++ A] end, "", Path) of
+        [_ | V] -> V;
+        [] -> []
+    end.
