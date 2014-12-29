@@ -99,7 +99,7 @@ read(IProto0, {struct, StructDef}, Tag)
     % by 1 to avoid overwriting the tag.
     Offset = if Tag =/= undefined -> 1; true -> 0 end,
 
-    {IProto1, ok} = read(IProto0, struct_begin),
+    {IProto1, ok} = read_(IProto0, struct_begin),
     RTuple0 = erlang:make_tuple(length(StructDef) + Offset, undefined),
     RTuple1 = if Tag =/= undefined -> setelement(1, RTuple0, Tag);
                  true              -> RTuple0
@@ -123,63 +123,74 @@ zip(N, [{Fid, Type} | Rest]) ->
         (#protocol{}, tprot_header_tag()) -> {#protocol{}, tprot_header_val() | {error, _Reason}};
         (#protocol{}, tprot_data_tag()) ->   {#protocol{}, {ok, any()}        | {error, _Reason}}.
 
-read(IProto, {struct, {Module, StructureName}}) when is_atom(Module),
+read(IProto, Type) ->
+    case Result = read_(IProto, Type) of
+        {IProto2, {ok, Data}} ->
+            case validate({Type, Data}) of
+                ok -> Result;
+                Error -> {IProto2, Error}
+            end;
+        _ ->
+            Result
+    end.
+
+read_(IProto, {struct, {Module, StructureName}}) when is_atom(Module),
                                                      is_atom(StructureName) ->
     read(IProto, Module:struct_info_ext(StructureName), StructureName);
 
-read(IProto, S={struct, Structure}) when is_list(Structure) ->
+read_(IProto, S={struct, Structure}) when is_list(Structure) ->
     read(IProto, S, undefined);
 
-read(IProto, {enum, {Module, EnumName}}) when is_atom(Module) ->
-    read(IProto, Module:enum_info(EnumName));
+read_(IProto, {enum, {Module, EnumName}}) when is_atom(Module) ->
+    read_(IProto, Module:enum_info(EnumName));
 
-read(IProto, {enum, Fields}) when is_list(Fields) ->
-    {IProto2, {ok, IVal}} = read(IProto, i32),
+read_(IProto, {enum, Fields}) when is_list(Fields) ->
+    {IProto2, {ok, IVal}} = read_(IProto, i32),
     {EnumVal, IVal} = lists:keyfind(IVal, 2, Fields),
     {IProto2, {ok, EnumVal}};
 
-read(IProto0, {list, Type}) ->
+read_(IProto0, {list, Type}) ->
     {IProto1, #protocol_list_begin{etype = EType, size = Size}} =
-        read(IProto0, list_begin),
+        read_(IProto0, list_begin),
     {EType, EType} = {term_to_typeid(Type), EType},
     {List, IProto2} = lists:mapfoldl(fun(_, ProtoS0) ->
-                                             {ProtoS1, {ok, Item}} = read(ProtoS0, Type),
+                                             {ProtoS1, {ok, Item}} = read_(ProtoS0, Type),
                                              {Item, ProtoS1}
                                      end,
                                      IProto1,
                                      lists:duplicate(Size, 0)),
-    {IProto3, ok} = read(IProto2, list_end),
+    {IProto3, ok} = read_(IProto2, list_end),
     {IProto3, {ok, List}};
 
-read(IProto0, {map, KeyType, ValType}) ->
+read_(IProto0, {map, KeyType, ValType}) ->
     {IProto1, #protocol_map_begin{size = Size, ktype = KType, vtype = VType}} =
-        read(IProto0, map_begin),
+        read_(IProto0, map_begin),
     {KType, KType} = {term_to_typeid(KeyType), KType},
     {VType, VType} = {term_to_typeid(ValType), VType},
     {Map, IProto2} = lists:foldl(fun(_, {M, ProtoS0}) ->
-                                             {ProtoS1, {ok, Key}} = read(ProtoS0, KeyType),
-                                             {ProtoS2, {ok, Val}} = read(ProtoS1, ValType),
+                                             {ProtoS1, {ok, Key}} = read_(ProtoS0, KeyType),
+                                             {ProtoS2, {ok, Val}} = read_(ProtoS1, ValType),
                                              {maps:put(Key, Val, M), ProtoS2}
                                      end,
                                      {#{}, IProto1},
                                      lists:duplicate(Size, 0)),
-    {IProto3, ok} = read(IProto2, map_end),
+    {IProto3, ok} = read_(IProto2, map_end),
     {IProto3, {ok, Map}};
 
-read(IProto0, {set, Type}) ->
+read_(IProto0, {set, Type}) ->
     {IProto1, #protocol_set_begin{etype = EType, size = Size}} =
-        read(IProto0, set_begin),
+        read_(IProto0, set_begin),
     {EType, EType} = {term_to_typeid(Type), EType},
     {List, IProto2} = lists:mapfoldl(fun(_, ProtoS0) ->
-                                             {ProtoS1, {ok, Item}} = read(ProtoS0, Type),
+                                             {ProtoS1, {ok, Item}} = read_(ProtoS0, Type),
                                              {Item, ProtoS1}
                                      end,
                                      IProto1,
                                      lists:duplicate(Size, 0)),
-    {IProto3, ok} = read(IProto2, set_end),
+    {IProto3, ok} = read_(IProto2, set_end),
     {IProto3, {ok, ordsets:from_list(List)}};
 
-read(Protocol, ProtocolType) ->
+read_(Protocol, ProtocolType) ->
     read_specific(Protocol, ProtocolType).
 
 %% NOTE: Keep this in sync with thrift_protocol_behaviour:read
@@ -193,8 +204,7 @@ read_specific(Proto = #protocol{module = Module,
     {Proto#protocol{data = NewData}, Result}.
 
 read_struct_loop(IProto0, StructIndex, RTuple) ->
-    {IProto1, #protocol_field_begin{type = FType, id = Fid}} =
-        thrift_protocol:read(IProto0, field_begin),
+    {IProto1, #protocol_field_begin{type = FType, id = Fid}} = read_(IProto0, field_begin),
     case {FType, Fid} of
         {?tType_STOP, _} ->
             {IProto1, {ok, RTuple}};
@@ -203,8 +213,8 @@ read_struct_loop(IProto0, StructIndex, RTuple) ->
                 {N, Fid, Type, Name} ->
                     case term_to_typeid(Type) of
                         FType ->
-                            {IProto2, {ok, Val}} = read(IProto1, Type),
-                            {IProto3, ok} = thrift_protocol:read(IProto2, field_end),
+                            {IProto2, {ok, Val}} = read_(IProto1, Type),
+                            {IProto3, ok} = read_(IProto2, field_end),
                             NewRTuple = setelement(N, RTuple, Val),
                             read_struct_loop(IProto3, StructIndex, NewRTuple);
                         _Expected ->
@@ -220,48 +230,48 @@ read_struct_loop(IProto0, StructIndex, RTuple) ->
 skip_field(FType, IProto0, StructIndex, RTuple) ->
     FTypeAtom = thrift_protocol:typeid_to_atom(FType),
     {IProto1, ok} = skip(IProto0, FTypeAtom),
-    {IProto2, ok} = read(IProto1, field_end),
+    {IProto2, ok} = read_(IProto1, field_end),
     read_struct_loop(IProto2, StructIndex, RTuple).
 
 -spec skip(#protocol{}, any()) -> {#protocol{}, ok}.
 
 skip(Proto0, struct) ->
-    {Proto1, ok} = read(Proto0, struct_begin),
+    {Proto1, ok} = read_(Proto0, struct_begin),
     {Proto2, ok} = skip_struct_loop(Proto1),
-    {Proto3, ok} = read(Proto2, struct_end),
+    {Proto3, ok} = read_(Proto2, struct_end),
     {Proto3, ok};
 
 skip(Proto0, map) ->
-    {Proto1, Map} = read(Proto0, map_begin),
+    {Proto1, Map} = read_(Proto0, map_begin),
     {Proto2, ok} = skip_map_loop(Proto1, Map),
-    {Proto3, ok} = read(Proto2, map_end),
+    {Proto3, ok} = read_(Proto2, map_end),
     {Proto3, ok};
 
 skip(Proto0, set) ->
-    {Proto1, Set} = read(Proto0, set_begin),
+    {Proto1, Set} = read_(Proto0, set_begin),
     {Proto2, ok} = skip_set_loop(Proto1, Set),
-    {Proto3, ok} = read(Proto2, set_end),
+    {Proto3, ok} = read_(Proto2, set_end),
     {Proto3, ok};
 
 skip(Proto0, list) ->
-    {Proto1, List} = read(Proto0, list_begin),
+    {Proto1, List} = read_(Proto0, list_begin),
     {Proto2, ok} = skip_list_loop(Proto1, List),
-    {Proto3, ok} = read(Proto2, list_end),
+    {Proto3, ok} = read_(Proto2, list_end),
     {Proto3, ok};
 
 skip(Proto0, Type) when is_atom(Type) ->
-    {Proto1, _Ignore} = read(Proto0, Type),
+    {Proto1, _Ignore} = read_(Proto0, Type),
     {Proto1, ok}.
 
 
 skip_struct_loop(Proto0) ->
-    {Proto1, #protocol_field_begin{type = Type}} = read(Proto0, field_begin),
+    {Proto1, #protocol_field_begin{type = Type}} = read_(Proto0, field_begin),
     case Type of
         ?tType_STOP ->
             {Proto1, ok};
         _Else ->
             {Proto2, ok} = skip(Proto1, thrift_protocol:typeid_to_atom(Type)),
-            {Proto3, ok} = read(Proto2, field_end),
+            {Proto3, ok} = read_(Proto2, field_end),
             skip_struct_loop(Proto3)
     end.
 
@@ -324,12 +334,6 @@ write_(Proto, {{struct, {Module, StructureName}}, Data})
        is_atom(StructureName),
        element(1, Data) =:= StructureName ->
     write_(Proto, {Module:struct_info(StructureName), Data});
-
-write_(_, {{struct, {Module, StructureName}}, Data})
-  when is_atom(Module),
-       is_atom(StructureName) ->
-    erlang:error(struct_unmatched, {{provided, element(1, Data)},
-                             {expected, StructureName}});
 
 write_(Proto, {{enum, Fields}, Data}) when is_list(Fields), is_atom(Data) ->
     {Data, IVal} = lists:keyfind(Data, 1, Fields),
@@ -449,8 +453,13 @@ validate(_Req, {{struct, {Mod, Name}}, Data}, Path) when is_tuple(Data) ->
     {struct, Types} = Mod:struct_info_ext(Name),
     validate_struct(Types, Elems, Path);
 validate(_Req, {{struct, StructDef}, Data}, Path) when is_tuple(Data), is_list(StructDef) ->
-    [_ | Elems] = tuple_to_list(Data),
-    validate_struct(StructDef, Elems, Path);
+    Elems = tuple_to_list(Data),
+    if
+        length(Elems) =:= length(StructDef) ->
+            validate_union(StructDef, Elems, Path);
+        true ->
+            validate_union(StructDef, tl(Elems), Path)
+    end;
 validate(_Req, {{enum, _Fields}, Value}, _Path) when is_atom(Value), Value =/= undefined ->
     ok;
 
@@ -462,10 +471,13 @@ validate(_Req, {Type, Value}, Path) -> throw({invalid, Path, Type, Value}).
 
 validate_struct(Types, Elems, Path) ->
     lists:foreach(
-        fun
-            ({{_, Req, Type, Name, _}, Data}) -> validate(Req, {Type, Data}, [Name | Path]);
-            ({{_, Type}, Data})               -> validate(required, {Type, Data}, Path)
-        end,
+        fun ({{_, Req, Type, Name, _}, Data}) -> validate(Req, {Type, Data}, [Name | Path]) end,
+        lists:zip(Types, Elems)
+    ).
+
+validate_union(Types, Elems, Path) ->
+    lists:foreach(
+        fun ({{_, Type}, Data}) -> validate(optional, {Type, Data}, Path) end,
         lists:zip(Types, Elems)
     ).
 
