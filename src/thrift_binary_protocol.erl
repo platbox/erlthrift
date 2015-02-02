@@ -156,7 +156,7 @@ write(This, {double, Double}) ->
 
 write(This0, {string, Str}) when is_list(Str) ->
     {This1, ok} = write(This0, {i32, length(Str)}),
-    {This2, ok} = write(This1, list_to_binary(Str)),
+    {This2, ok} = write(This1, iolist_to_binary(Str)),
     {This2, ok};
 
 write(This0, {string, Bin}) when is_binary(Bin) ->
@@ -164,7 +164,7 @@ write(This0, {string, Bin}) when is_binary(Bin) ->
     {This2, ok} = write(This1, Bin),
     {This2, ok};
 
-%% Data :: iolist()
+%% Data :: binary()
 write(This = #binary_protocol{transport = Trans}, Data) ->
     {NewTransport, Result} = thrift_transport:write(Trans, Data),
     {This#binary_protocol{transport = NewTransport}, Result}.

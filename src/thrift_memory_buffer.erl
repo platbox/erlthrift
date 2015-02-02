@@ -32,14 +32,11 @@
 -include("thrift_transport_behaviour.hrl").
 
 new() ->
-    State = #memory_buffer{buffer = []},
+    State = #memory_buffer{buffer = <<>>},
     thrift_transport:new(?MODULE, State).
 
-new (Buf) when is_list (Buf) ->
-  State = #memory_buffer{buffer = Buf},
-  thrift_transport:new(?MODULE, State);
-new (Buf) ->
-  State = #memory_buffer{buffer = [Buf]},
+new(Buf) ->
+  State = #memory_buffer{buffer = iolist_to_binary(Buf)},
   thrift_transport:new(?MODULE, State).
 
 new_transport_factory() ->
@@ -47,16 +44,15 @@ new_transport_factory() ->
 
 %% Writes data into the buffer
 write(State = #memory_buffer{buffer = Buf}, Data) ->
-    {State#memory_buffer{buffer = [Buf, Data]}, ok}.
+    {State#memory_buffer{buffer = <<Buf/binary, Data/binary>>}, ok}.
 
 flush(State = #memory_buffer {buffer = Buf}) ->
-    {State#memory_buffer{buffer = []}, Buf}.
+    {State#memory_buffer{buffer = <<>>}, Buf}.
 
 close(State) ->
     {State, ok}.
 
 read(State = #memory_buffer{buffer = Buf}, Len) when is_integer(Len) ->
-    Binary = iolist_to_binary(Buf),
-    Give = min(iolist_size(Binary), Len),
-    {Result, Remaining} = split_binary(Binary, Give),
+    Give = min(byte_size(Buf), Len),
+    {Result, Remaining} = split_binary(Buf, Give),
     {State#memory_buffer{buffer = Remaining}, {ok, Result}}.
